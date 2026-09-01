@@ -1,0 +1,109 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+
+    <application
+        android:name=".WhisperApp"
+        android:allowBackup="true"
+        android:label="Moonshine Speech to Text"
+        android:theme="@style/Theme.WhisperKeyboard"
+        android:requestLegacyExternalStorage="true"
+        android:icon="@android:drawable/ic_btn_speak_now">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Moonshine Speech to Text">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".SettingsActivity"
+            android:label="Settings"
+            android:exported="false"/>
+        <activity
+            android:name=".PrivacyDashboardActivity"
+            android:label="Privacy Dashboard"
+            android:exported="false"/>
+
+        <service
+            android:name=".WhisperKeyboardService"
+            android:label="Moonshine Speech to Text"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method"/>
+        </service>
+
+        <service
+            android:name=".ProcessingService"
+            android:label="Moonshine Processing"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Shows ongoing progress while transcription chunks are processed and typed"/>
+        </service>
+
+        <service
+            android:name=".WhisperAccessibilityService"
+            android:label="Moonshine Typing Bridge"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config"/>
+        </service>
+
+        <service
+            android:name=".QuickSwitchService"
+            android:label="Mic Bubble Quick Switch"
+            android:exported="false"
+            android:foregroundServiceType="microphone"/>
+        <service
+            android:name=".WhisperRecognitionService"
+            android:label="Moonshine Voice Typing"
+            android:permission="android.permission.BIND_RECOGNITION_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService"/>
+            </intent-filter>
+        </service>
+<service
+            android:name=".MeetingRecordService"
+            android:foregroundServiceType="microphone"
+            android:exported="false"/>
+
+        <service
+            android:name=".ImeRecordService"
+            android:foregroundServiceType="microphone"
+            android:exported="false"/>
+
+    </application>
+</manifest>
+
+
+
+
+

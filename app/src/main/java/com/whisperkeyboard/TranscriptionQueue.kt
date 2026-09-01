@@ -1,0 +1,368 @@
+package com.whisperkeyboard
+
+import android.content.Context
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.exp
+
+object TranscriptionQueue {
+
+    private const val TAG = "TranscriptionQueue"
+
+    data class Job(
+        val context: Context,
+        val wavFile: File,
+        val model: String,
+        val lang: String,
+        val onResult: (String) -> Unit,
+        val onError: (String) -> Unit
+    )
+
+    interface ProgressListener { fun onProgress(pct: Int) }
+
+    private val queue = LinkedBlockingQueue<Job>()
+    private val pendingCount = AtomicInteger(0)
+    private val submittedCount = AtomicInteger(0)
+    private val completedCount = AtomicInteger(0)
+    private val skipCurrentFlag = AtomicBoolean(false)
+    private val stopAllFlag = AtomicBoolean(false)
+    private val failedJobs = mutableListOf<Job>()
+    private val paused = AtomicBoolean(false)
+    private val executor = Executors.newSingleThreadExecutor { r -> Thread(r, "whisper-worker").apply { isDaemon = true } }
+
+    @Volatile private var currentModel = ""
+    @Volatile private var currentPct = 0
+    @Volatile private var currentFileSec = 0.0
+    /** True while the single worker thread is inside its loop. Replaces racy isProcessing flag. */
+    private val workerRunning = AtomicBoolean(false)
+    private val listeners = mutableSetOf<ProgressListener>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var progressTimer: java.util.Timer? = null
+
+    // ---- adaptive stats ----
+
+    private fun defaultRatio(model: String): Double = when (model) {
+        "tiny" -> 0.06; "base" -> 0.10; "small" -> 0.28; "medium" -> 0.65; else -> 0.30
+    }
+
+    private fun getAvgRatio(ctx: Context, model: String): Double {
+        return try {
+            val prefs = ctx.getSharedPreferences("whisper_stats", Context.MODE_PRIVATE)
+            // per-model EMA from the FIRST real sample onward - never fall back to the
+            // cross-model global for estimation (a base-model average would misestimate small)
+            val perCount = prefs.getInt("count_$model", 0)
+            if (perCount >= 1) {
+                val r = prefs.getFloat("ratio_$model", defaultRatio(model).toFloat()).toDouble()
+                Log.i(TAG, "avgRatio $model = $r from $perCount samples (per-model)")
+                return r
+            }
+            defaultRatio(model)
+        } catch (_: Exception) { defaultRatio(model) }
+    }
+
+    private fun recordStats(ctx: Context, model: String, audioSec: Double, transcribeSec: Double) {
+        try {
+            if (audioSec < 0.5 || transcribeSec < 0.3) return
+            val ratio = (transcribeSec / audioSec).coerceIn(0.02, 5.0)
+            val prefs = ctx.getSharedPreferences("whisper_stats", Context.MODE_PRIVATE)
+            val ed = prefs.edit()
+            // per-model EXPONENTIAL moving average (alpha=0.2 -> ~last 5 runs dominate):
+            // adapts to current device speed (thermals/background load) while still averaging
+            // every past run. A plain cumulative mean goes stale after ~50 samples (<2% shift),
+            // which made the progress bar look like it had "no effect".
+            val cnt = prefs.getInt("count_$model", 0)
+            val old = prefs.getFloat("ratio_$model", ratio.toFloat()).toDouble()
+            val newAvg = if (cnt == 0) ratio else old * 0.8 + ratio * 0.2
+            ed.putFloat("ratio_$model", newAvg.toFloat())
+            ed.putInt("count_$model", cnt + 1)
+            // global (display/debug only - NOT used for estimates)
+            val gCnt = prefs.getInt("count_global", 0)
+            val gOld = prefs.getFloat("ratio_global", ratio.toFloat()).toDouble()
+            val gNew = if (gCnt == 0) ratio else gOld * 0.9 + ratio * 0.1
+            ed.putFloat("ratio_global", gNew.toFloat())
+            ed.putInt("count_global", gCnt + 1)
+            // also store last audio/time for debug
+            ed.putFloat("last_audio_${model}", audioSec.toFloat())
+            ed.putFloat("last_time_${model}", transcribeSec.toFloat())
+            ed.apply()
+            Log.i(TAG, "recordStats model=$model audio=${String.format("%.1f", audioSec)}s time=${String.format("%.1f", transcribeSec)}s ratio=${String.format("%.3f", ratio)} -> ema $model=${String.format("%.3f", newAvg)} global=${String.format("%.3f", gNew)} cnt $cnt/$gCnt")
+        } catch (e: Exception) { Log.w(TAG, "recordStats failed: ${e.message}") }
+    }
+
+    fun addListener(l: ProgressListener) { synchronized(listeners) { listeners.add(l) } }
+    fun removeListener(l: ProgressListener) { synchronized(listeners) { listeners.remove(l) } }
+
+    private fun notifyProgress(pct: Int) {
+        currentPct = pct
+        val copy = synchronized(listeners) { listeners.toList() }
+        mainHandler.post { copy.forEach { try { it.onProgress(pct) } catch (_: Exception) {} } }
+    }
+
+    private fun estimateSeconds(wav: File): Double {
+        return try {
+            val dataBytes = wav.length() - 44
+            if (dataBytes <= 0) 1.0 else dataBytes / 32000.0
+        } catch (_: Exception) { 5.0 }
+    }
+
+    private fun expectedTranscribeSec(ctx: Context, model: String, audioSec: Double): Double {
+        val ratio = getAvgRatio(ctx, model)
+        // overhead 0.6s for init + commit
+        return maxOf(1.2, audioSec * ratio + 0.6)
+    }
+
+    private fun startSimulatedProgress(ctx: Context, model: String, wav: File) {
+        stopSimulatedProgress()
+        val audioSec = estimateSeconds(wav)
+        currentFileSec = audioSec
+        val expected = expectedTranscribeSec(ctx, model, audioSec)
+        Log.i(TAG, "startProgress audio=${String.format("%.1f", audioSec)}s model=$model expected=${String.format("%.1f", expected)}s ratio=${String.format("%.3f", getAvgRatio(ctx, model))}")
+        notifyProgress(3)
+        var elapsed = 0.0
+        progressTimer = java.util.Timer(true)
+        progressTimer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                elapsed += 0.2
+                val pct = when {
+                    elapsed < expected -> ((elapsed / expected) * 88).toInt().coerceIn(3, 88)
+                    else -> {
+                        // creep 88 -> 98 asymptotically after expected exceeded
+                        val extra = elapsed - expected
+                        val creep = (9 * (1 - exp(-extra / (expected * 0.6 + 2.0)))).toInt()
+                        (88 + creep).coerceIn(88, 98)
+                    }
+                }
+                notifyProgress(pct)
+            }
+        }, 200, 200)
+    }
+
+    private fun stopSimulatedProgress() {
+        try { progressTimer?.cancel() } catch (_: Exception) {}
+        progressTimer = null
+    }
+
+    fun status(): String {
+        val q = pendingCount.get()
+        val f = synchronized(failedJobs) { failedJobs.size }
+        val state = when {
+            paused.get() -> "PAUSED"
+            workerRunning.get() -> {
+                val (cur, total) = batchPosition()
+                "Processing $cur/$total $currentModel ${currentPct}%"
+            }
+            else -> "Idle"
+        }
+        val retry = if (f > 0) " | $f failed" else ""
+        return "Queue: $q pending | $state$retry"
+    }
+
+    fun progress(): Int = currentPct
+    fun isPaused(): Boolean = paused.get()
+    /** True while the worker loop is running or anything is queued. */
+    fun isActive(): Boolean = workerRunning.get() || pendingCount.get() > 0
+    fun pendingCount(): Int = pendingCount.get()
+
+    /** Discard the result of the currently processing job when it finishes; continue with next. */
+    fun skipCurrentJob() {
+        if (workerRunning.get()) { skipCurrentFlag.set(true); AppLog.i(TAG, "skip requested for current job") }
+    }
+
+    /** Skip current + clear everything queued. */
+    fun stopEverything(): Int {
+        AppLog.i(TAG, "STOP ALL requested")
+        if (workerRunning.get()) skipCurrentFlag.set(true)
+        stopAllFlag.set(true)
+        WhisperEngine.cancelCurrent()
+        paused.set(false)
+        return clearQueue()
+    }
+
+    /** Position info for UI: 1-based index of job being processed / total submitted in batch (clamped). */
+    fun batchPosition(): Pair<Int, Int> {
+        val total = maxOf(submittedCount.get(), completedCount.get())
+        val cur = (completedCount.get() + if (workerRunning.get() && pendingCount.get() > 0) 1 else 0).coerceIn(1, total)
+        return Pair(cur, total)
+    }
+
+    fun enqueue(job: Job) {
+        stopAllFlag.set(false)
+        pendingCount.incrementAndGet()
+        submittedCount.incrementAndGet()
+        queue.put(job)
+        Log.i(TAG, "Enqueued job, pending=${pendingCount.get()} paused=${paused.get()}")
+        ProcessingService.notifyActivity()
+        ensureWorker()
+    }
+
+    fun pause() {
+        paused.set(true)
+        // drop the in-flight job too - user wants immediate response, not a long tail
+        if (workerRunning.get()) skipCurrentFlag.set(true)
+        WhisperEngine.cancelCurrent()
+        Log.i(TAG, "Queue paused (current job cancelled)")
+        AppLog.i(TAG, "paused - current job cancelled")
+    }
+    fun resume() { if (paused.compareAndSet(true, false)) { Log.i(TAG, "Queue resumed"); ensureWorker() } }
+    fun togglePause(): Boolean = if (paused.get()) { resume(); false } else { pause(); true }
+
+    fun clearQueue(): Int {
+        val drained = mutableListOf<Job>()
+        queue.drainTo(drained)
+        var deleted = 0
+        for (j in drained) { try { if (j.wavFile.exists()) { j.wavFile.delete(); deleted++ } } catch (_: Exception) {} ; pendingCount.decrementAndGet() }
+        // also cancel + discard whatever is processing right now (flag only matters if a job is live,
+        // otherwise it would silently swallow the NEXT job)
+        if (workerRunning.get()) skipCurrentFlag.set(true)
+        WhisperEngine.cancelCurrent()
+        Log.i(TAG, "Cleared $deleted queued files (+cancelled current)")
+        AppLog.i(TAG, "clearQueue: $deleted dropped, current cancelled")
+        return deleted
+    }
+
+    fun forceStop() { paused.set(false); clearQueue(); Log.i(TAG, "Force stop - queue cleared") }
+
+    fun retryFailed() {
+        val toRetry: List<Job>
+        synchronized(failedJobs) { toRetry = failedJobs.toList(); failedJobs.clear() }
+        if (toRetry.isEmpty()) return
+        Log.i(TAG, "Retrying ${toRetry.size} failed jobs")
+        for (j in toRetry) { if (j.wavFile.exists()) enqueue(j) else Log.w(TAG, "Failed file missing: ${j.wavFile}") }
+    }
+
+    fun failedCount(): Int = synchronized(failedJobs) { failedJobs.size }
+
+    private fun ensureWorker() {
+        // CAS guard: only one worker loop; safe against the enqueue-during-exit race
+        if (!workerRunning.compareAndSet(false, true)) return
+        if (paused.get()) { workerRunning.set(false); Log.i(TAG, "Paused - worker not started"); return }
+        executor.submit {
+            Log.i(TAG, "Worker started")
+            try {
+                while (true) {
+                    try {
+                        if (paused.get()) {
+                            Log.i(TAG, "Worker pausing")
+                            stopSimulatedProgress(); notifyProgress(0)
+                            break
+                        }
+                        val job = try { queue.poll(500, TimeUnit.MILLISECONDS) } catch (e: InterruptedException) { null }
+                        if (job == null) {
+                            // no work right now; exit (finally re-checks for races)
+                            Log.i(TAG, "Worker idle")
+                            stopSimulatedProgress(); notifyProgress(0)
+                            submittedCount.set(0); completedCount.set(0); stopAllFlag.set(false); currentPct = 0
+                            break
+                        }
+                        currentModel = job.model
+                        AppLog.i(TAG, "process ${job.model}/${job.lang} ${job.wavFile.name} (${job.wavFile.length() / 1024} KB)")
+                        val audioSec = estimateSeconds(job.wavFile)
+                        val startMs = System.currentTimeMillis()
+                        startSimulatedProgress(job.context, job.model, job.wavFile)
+                        var success = false
+                        var resultText = ""
+                        var errorMsg = ""
+                        var attempt = 0
+                        while (attempt < 2 && !success) {
+                            attempt++
+                            try {
+                                // Moonshine: check via ModelManager.isModelReady or engine cache
+                                if (!ModelManager.isModelReady(job.context, job.model) && !MoonshineEngine.isLoaded(job.model)) {
+                                    // Try to ensure model (will download if needed)
+                                    val ok = MoonshineEngine.ensureModel(job.context, job.model, job.lang)
+                                    if (!ok) throw IllegalStateException("Moonshine model ${job.model} not ready. Download it in app first. ${MoonshineEngine.lastError}")
+                                }
+                                val modelFile = ModelManager.modelFile(job.context, job.model)
+                                resultText = WhisperEngine.transcribe(modelFile.absolutePath, job.wavFile.absolutePath, job.lang).trim()
+                                if (resultText.startsWith("ERROR: cancelled")) {
+                                    // user pressed Clear/Stop/Pause - do NOT retry, just drop
+                                    Log.i(TAG, "job cancelled by user")
+                                    AppLog.i(TAG, "job cancelled by user")
+                                    errorMsg = "cancelled"
+                                    stopSimulatedProgress(); notifyProgress(0)
+                                    break
+                                }
+                                if (resultText.startsWith("ERROR:")) {
+                                    // native-level failure: retry once (self-heal reloads model), then fail
+                                    if (attempt < 2) { Log.w(TAG, "Attempt $attempt returned ${resultText.take(60)} - retrying"); AppLog.w(TAG, "attempt $attempt ERROR result - retrying"); continue }
+                                    throw IllegalStateException(resultText)
+                                }
+                                Log.i(TAG, "Result: ${resultText.take(120)}")
+                                AppLog.i(TAG, "done ${job.model} in ${(System.currentTimeMillis() - startMs) / 1000.0}s: ${resultText.take(50)}")
+                                success = true
+                                val elapsedSec = (System.currentTimeMillis() - startMs) / 1000.0
+                                recordStats(job.context, job.model, audioSec, elapsedSec)
+                                stopSimulatedProgress(); notifyProgress(100)
+                                Thread.sleep(150) // brief pause so the 100% tick is visible
+                            } catch (e: Exception) {
+                                if (attempt < 2) { Log.w(TAG, "Attempt $attempt failed: ${e.message} - retrying"); Thread.sleep(300); continue }
+                                Log.e(TAG, "Transcribe failed after $attempt attempts: ${e.message}", e)
+                                AppLog.e(TAG, "transcribe failed x$attempt: ${e.message}")
+                                errorMsg = e.message ?: "Unknown error"
+                                stopSimulatedProgress(); notifyProgress(0)
+                                break
+                            } catch (e: OutOfMemoryError) {
+                                errorMsg = "Out of memory - try a smaller model"
+                                Log.e(TAG, "OOM: ${e.message}")
+                                AppLog.e(TAG, "OOM")
+                                stopSimulatedProgress(); notifyProgress(0)
+                                break
+                            }
+                        }
+                        if (!success && errorMsg.isEmpty()) errorMsg = "Unknown error"
+                        val wasCancelled = errorMsg.contains("cancelled")
+                        if (!success && !wasCancelled) {
+                            try {
+                                val failDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "WhisperNotes/failed")
+                                failDir.mkdirs()
+                                // avoid duplicate copies when a retry fails again - reuse the same file
+                                val saved = if (job.wavFile.name.startsWith("failed_")) job.wavFile
+                                    else File(failDir, "failed_${System.currentTimeMillis()}.wav").also { job.wavFile.copyTo(it, overwrite = true) }
+                                AppLog.w(TAG, "saved for retry: ${saved.name}")
+                                val retryJob = job.copy(wavFile = saved)
+                                synchronized(failedJobs) {
+                                    if (failedJobs.none { it.wavFile.absolutePath == saved.absolutePath }) failedJobs.add(retryJob)
+                                }
+                            } catch (ex: Exception) {
+                                Log.w(TAG, "Failed to save failed WAV: ${ex.message}")
+                                synchronized(failedJobs) { failedJobs.add(job) }
+                            }
+                        }
+                        try {
+                            pendingCount.decrementAndGet()
+                            completedCount.incrementAndGet()
+                            if (success || job.wavFile.absolutePath.contains("cache")) {
+                                try { if (job.wavFile.exists()) job.wavFile.delete() } catch (_: Exception) {}
+                            }
+                        } catch (_: Exception) {}
+                        val skipped = skipCurrentFlag.getAndSet(false)
+                        val stoppedAll = stopAllFlag.get()
+                        if (skipped || stoppedAll || wasCancelled) {
+                            AppLog.i(TAG, "job dropped (${if (wasCancelled) "cancelled" else if (skipped) "skipped" else "stop-all"}) - result discarded")
+                        } else if (success) job.onResult(resultText) else job.onError(errorMsg)
+                        notifyProgress(0)
+                    } catch (t: Throwable) {
+                        // never let the worker thread die
+                        Log.e(TAG, "Worker loop error: ${t.message}", t)
+                        AppLog.e(TAG, "worker error: ${t.message}")
+                        stopSimulatedProgress(); notifyProgress(0)
+                    }
+                }
+            } finally {
+                workerRunning.set(false)
+                // RACE FIX: if a job was enqueued while we were exiting, restart immediately.
+                // Without this, jobs could sit stranded until the next enqueue.
+                if (!queue.isEmpty() && !paused.get()) ensureWorker()
+            }
+        }
+    }
+}
+

@@ -1,0 +1,26 @@
+# Android / Gradle
+.gradle/
+build/
+app/build/
+app/.cxx/
+app/.externalNativeBuild/
+local.properties
+*.keystore
+gradle-signing.properties
+*.apk
+*.aab
+*.bin
+*.pt
+*.onnx
+*.ort
+# Models downloaded on device, whisper.cpp clone
+app/src/main/cpp/whisper.cpp/
+app/src/main/assets/
+# IDE
+.idea/
+*.iml
+captures/
+.navigation/
+# OS
+.DS_Store
+Thumbs.db
