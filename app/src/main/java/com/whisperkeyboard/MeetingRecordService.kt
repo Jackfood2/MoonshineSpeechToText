@@ -25,10 +25,17 @@ class MeetingRecordService : Service() {
         const val TAG = "MeetingService"
         const val CHANNEL_ID = "whisper_meeting"
         const val NOTIFICATION_ID = 101
-        const val CHUNK_DURATION_MS = 30_000L
+        // Gold standard VAD chunk - matches desktop main.py _build_vad_chunks target 20s max 28s min 10s
+        // No word cut, no overlap/dup, boundaries at silence
+        const val TARGET_CHUNK_MS = 20_000L
+        const val MIN_CHUNK_MS = 10_000L
+        const val MAX_CHUNK_MS = 28_000L
+        const val CHUNK_DURATION_MS = 30_000L // legacy fallback
+        const val SILENCE_RMS_THRESHOLD = 0.015  // ~ -36dB, matches librosa top_db 28
+        const val SILENCE_MIN_MS = 300L
     }
 
-    private var isRecording = false
+    @Volatile private var isRecording = false
     private var recordThread: Thread? = null
     private var startTimeMs = 0L
     private var model = "small"
@@ -38,6 +45,7 @@ class MeetingRecordService : Service() {
     private var segmentCounter = 0
     private val allText = StringBuilder()
     private var wakeLock: PowerManager.WakeLock? = null
+    private val flushExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "meeting-flush").apply { isDaemon = true } }
 
     override fun onCreate() {
         super.onCreate()
@@ -102,6 +110,14 @@ class MeetingRecordService : Service() {
 
     private fun startMeeting() {
         if (isRecording) return
+        // H5: enforce mic mutual exclusion - don't start if other recorder active
+        if (TranscriptionQueue.isActive()) {
+            Log.w(TAG, "Mic busy - TranscriptionQueue active, not starting meeting")
+            try {
+                android.widget.Toast.makeText(this, "Mic busy - queue processing", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+            return
+        }
         isRecording = true
         startTimeMs = System.currentTimeMillis()
         segmentCounter = 0
@@ -127,18 +143,27 @@ class MeetingRecordService : Service() {
 
         recordThread = Thread {
             try {
-                val recorder = AudioUtils.createRecorder()
+                val recorder = AudioUtils.createRecorder(applicationContext)
                 recorder.startRecording()
 
                 var pcmChunk = ByteArrayOutputStream()
                 var chunkStartTime = System.currentTimeMillis()
                 var lastNotifUpdate = 0L
+                var silenceStartMs: Long? = null
+                var lastRms = 0.0
 
                 while (isRecording) {
                     val buffer = ByteArray(4096)
                     val read = recorder.read(buffer, 0, buffer.size)
                     if (read > 0) {
                         pcmChunk.write(buffer, 0, read)
+                        // track silence for VAD boundary
+                        lastRms = AudioUtils.rms16(buffer, read)
+                        if (lastRms < SILENCE_RMS_THRESHOLD) {
+                            if (silenceStartMs == null) silenceStartMs = System.currentTimeMillis()
+                        } else {
+                            silenceStartMs = null
+                        }
                     }
 
                     val now = System.currentTimeMillis()
@@ -153,15 +178,26 @@ class MeetingRecordService : Service() {
                         nm.notify(NOTIFICATION_ID, buildNotification(status))
                     }
 
-                    if (now - chunkStartTime >= CHUNK_DURATION_MS && pcmChunk.size() > 8000) {
-                        flushChunk(pcmChunk, chunkStartTime)
+                    val chunkElapsed = now - chunkStartTime
+                    val isSilence = silenceStartMs != null && (now - silenceStartMs!!) >= SILENCE_MIN_MS
+                    val shouldFlush = when {
+                        chunkElapsed >= MAX_CHUNK_MS && pcmChunk.size() > 8000 -> true // force at max 28s
+                        chunkElapsed >= TARGET_CHUNK_MS && isSilence && pcmChunk.size() > 8000 -> true // gold: at silence near 20s
+                        chunkElapsed >= CHUNK_DURATION_MS && pcmChunk.size() > 8000 -> true // legacy fallback 30s
+                        else -> false
+                    }
+                    if (shouldFlush) {
+                        val toFlush = pcmChunk
+                        flushExecutor.submit { flushChunk(toFlush, chunkStartTime) }
                         pcmChunk = ByteArrayOutputStream()
                         chunkStartTime = now
+                        silenceStartMs = null
                     }
                 }
 
                 if (pcmChunk.size() > 4000) {
-                    flushChunk(pcmChunk, chunkStartTime)
+                    val toFlush = pcmChunk
+                    flushExecutor.submit { flushChunk(toFlush, chunkStartTime) }
                 }
 
                 try {
@@ -229,33 +265,31 @@ class MeetingRecordService : Service() {
             stopSelf()
             return
         }
-
         isRecording = false
-        Log.i(TAG, "Stopping meeting...")
-
+        Log.i(TAG, "Stopping meeting... (non-blocking)")
+        // show stopping state immediately - don't block main thread (ANR fix)
         try {
-            recordThread?.join(10000)
-        } catch (e: InterruptedException) {
-            Log.w(TAG, "Thread join interrupted")
-        }
-
-        // Wait for remaining queue items
-        var waitCount = 0
-        while (TranscriptionQueue.status().contains("pending") && waitCount < 30) {
-            try { Thread.sleep(1000) } catch (e: InterruptedException) { break }
-            waitCount++
-            Log.i(TAG, "Waiting for queue... ($waitCount)")
-        }
-
-        val path = transcriptFile?.absolutePath ?: "unknown"
-        Log.i(TAG, "Meeting saved: $path")
-
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.cancel(NOTIFICATION_ID)
-
-        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIFICATION_ID, buildNotification("Stopping - finishing queue..."))
+        } catch (_: Exception) {}
+        Thread {
+            try { recordThread?.join(10000) } catch (_: Exception) {}
+            var waitCount = 0
+            while (TranscriptionQueue.pendingCount() > 0 && waitCount < 30) {
+                try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                waitCount++
+                Log.i(TAG, "Waiting for queue... ($waitCount) pending=${TranscriptionQueue.pendingCount()}")
+            }
+            val path = transcriptFile?.absolutePath ?: "unknown"
+            Log.i(TAG, "Meeting saved: $path")
+            try {
+                val nm2 = getSystemService(NotificationManager::class.java)
+                nm2.cancel(NOTIFICATION_ID)
+            } catch (_: Exception) {}
+            try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+            try { stopSelf() } catch (_: Exception) {}
+        }.apply { isDaemon = true; start() }
     }
 
     override fun onDestroy() {

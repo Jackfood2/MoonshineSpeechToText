@@ -11,6 +11,7 @@ object AppLog {
     private const val MAX = 300
     private val buf = ArrayDeque<String>(MAX)
     private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val fmtLock = Any()
 
     @Volatile var lastError: String = ""
         private set
@@ -20,7 +21,8 @@ object AppLog {
     fun e(tag: String, msg: String) { lastError = "$tag: $msg"; add("E", tag, msg) }
 
     private fun add(level: String, tag: String, msg: String) {
-        val line = "${fmt.format(Date())} $level/$tag: $msg"
+        val time = synchronized(fmtLock) { fmt.format(Date()) }
+        val line = "$time $level/$tag: $msg"
         synchronized(buf) {
             buf.addLast(line)
             while (buf.size > MAX) buf.removeFirst()

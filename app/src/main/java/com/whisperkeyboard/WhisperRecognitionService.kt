@@ -38,13 +38,18 @@ class WhisperRecognitionService : RecognitionService() {
         val lang = getSharedPreferences("whisper", MODE_PRIVATE).getString("lang", "auto") ?: "auto"
         thread = Thread {
             var pcm: ByteArrayOutputStream? = null
+            var rec: AudioRecord? = null
             try {
                 cb.readyForSpeech(Bundle())
-                val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                val rec = AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, 32000))
+                rec = try { AudioUtils.createRecorder(this@WhisperRecognitionService) } catch (_: Exception) {
+                    val minBufRaw = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    val minBuf = if (minBufRaw <= 0) 2048 else minBufRaw
+                    AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, 32000))
+                }
                 recorder = rec
-                rec.startRecording()
+                val recVal = rec ?: throw IllegalStateException("recorder null")
+                try { recVal.startRecording() } catch (e: Exception) { throw IllegalStateException("mic start failed: ${e.message}") }
                 cb.beginningOfSpeech()
                 val buf = ByteArray(4096)
                 pcm = ByteArrayOutputStream()
@@ -52,7 +57,7 @@ class WhisperRecognitionService : RecognitionService() {
                 var hasVoice = false
                 val start = System.currentTimeMillis()
                 while (listening) {
-                    val n = rec.read(buf, 0, buf.size)
+                    val n = recVal.read(buf, 0, buf.size)
                     if (n <= 0) break
                     synchronized(pcm) { pcm.write(buf, 0, n) }
                     val rms = AudioUtils.rms16(buf, n)
@@ -61,9 +66,7 @@ class WhisperRecognitionService : RecognitionService() {
                     // VAD auto-end after 1.3s silence, hard cap 30s
                     if ((hasVoice && System.currentTimeMillis() - lastVoice > 1300) || elapsed > 30_000) break
                 }
-                cb.endOfSpeech()
-                try { rec.stop(); rec.release() } catch (_: Exception) {}
-                recorder = null
+                try { cb.endOfSpeech() } catch (_: Exception) {}
                 if (!listening) return@Thread
                 val bytes = synchronized(pcm) { pcm.toByteArray() }
                 if (bytes.size < 1800) {
@@ -85,6 +88,10 @@ class WhisperRecognitionService : RecognitionService() {
             } catch (e: Throwable) {
                 AppLog.e(TAG, "listen error: ${e.message}")
                 try { cb.error(SpeechRecognizer.ERROR_CLIENT) } catch (_: Exception) {}
+            } finally {
+                try { rec?.stop() } catch (_: Exception) {}
+                try { rec?.release() } catch (_: Exception) {}
+                if (rec != null && recorder === rec) recorder = null
             }
         }.apply { isDaemon = true; start() }
     }

@@ -321,7 +321,7 @@ object TranscriptionQueue {
                         val wasCancelled = errorMsg.contains("cancelled")
                         if (!success && !wasCancelled) {
                             try {
-                                val failDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "WhisperNotes/failed")
+                                val failDir = File(job.context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: File(job.context.cacheDir, "failed"), "failed")
                                 failDir.mkdirs()
                                 // avoid duplicate copies when a retry fails again - reuse the same file
                                 val saved = if (job.wavFile.name.startsWith("failed_")) job.wavFile

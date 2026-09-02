@@ -48,18 +48,22 @@ object AudioUtils {
         val source = if (useBt) {
             // Try VOICE_COMMUNICATION for BT headset; fallback to MIC if fails
             try {
-                // Start Bluetooth SCO if available
                 context?.let {
                     val am = it.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                     if (am.isBluetoothScoAvailableOffCall) {
-                        try { am.startBluetoothSco() } catch (_: Exception) {}
+                        try {
+                            am.startBluetoothSco()
+                            // SCO is async - wait briefly for connection before creating AudioRecord
+                            try { Thread.sleep(400) } catch (_: Exception) {}
+                        } catch (_: Exception) {}
                     }
                 }
             } catch (_: Exception) {}
             MediaRecorder.AudioSource.VOICE_COMMUNICATION
         } else MediaRecorder.AudioSource.MIC
 
-        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
+        var minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
+        if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE || minBuf <= 0) minBuf = 2048
         val bufSize = (minBuf * 4).coerceAtLeast(8192)
         return try {
             AudioRecord(source, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufSize)

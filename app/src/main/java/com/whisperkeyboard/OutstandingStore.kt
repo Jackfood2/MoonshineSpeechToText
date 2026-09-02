@@ -3,11 +3,6 @@ package com.whisperkeyboard
 import android.content.Context
 import org.json.JSONArray
 
-/**
- * Transcripts that could not be typed yet (e.g. recorded on lock screen).
- * Persisted so nothing is lost; the keyboard shows a one-tap-per-entry button
- * once the user focuses a field again.
- */
 object OutstandingStore {
 
     private const val PREF = "whisper_outstanding"
@@ -24,6 +19,13 @@ object OutstandingStore {
         copy.forEach { try { it() } catch (_: Exception) {} }
     }
 
+    private fun JSONArray.removeFirstCompat(): JSONArray {
+        if (length() == 0) return this
+        val out = JSONArray()
+        for (i in 1 until length()) out.put(get(i))
+        return out
+    }
+
     @Synchronized fun count(ctx: Context?): Int {
         if (ctx == null) return 0
         return try {
@@ -36,12 +38,10 @@ object OutstandingStore {
         if (ctx == null || text.isBlank()) return
         try {
             val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            val arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: JSONArray()
-            // cap: drop oldest beyond MAX
-            while (arr.length() >= MAX) { arr.remove(0) }
+            var arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: JSONArray()
+            while (arr.length() >= MAX) { arr = arr.removeFirstCompat() }
             arr.put(text.trim())
             prefs.edit().putString(KEY, arr.toString()).apply()
-            // optional convenience copy (Settings toggle) - off = retrieve only via keyboard button
             val clipOn = ctx.getSharedPreferences("whisper", Context.MODE_PRIVATE).getBoolean("out_clipboard", true)
             if (clipOn) {
                 val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
@@ -53,29 +53,27 @@ object OutstandingStore {
         } catch (_: Exception) {}
     }
 
-    /** Oldest first - returns and removes one entry. */
     @Synchronized fun popOldest(ctx: Context?): String? {
         if (ctx == null) return null
         return try {
             val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            val arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: return null
+            var arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: return null
             if (arr.length() == 0) return null
             val text = arr.getString(0)
-            arr.remove(0)
+            arr = arr.removeFirstCompat()
             prefs.edit().putString(KEY, arr.toString()).apply()
             notifyChanged()
             text
         } catch (_: Exception) { null }
     }
 
-    /** Remove the oldest entry without returning it (discard). */
     @Synchronized fun discardOldest(ctx: Context?): Boolean {
         if (ctx == null) return false
         return try {
             val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            val arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: return false
+            var arr = prefs.getString(KEY, null)?.let { JSONArray(it) } ?: return false
             if (arr.length() == 0) return false
-            arr.remove(0)
+            arr = arr.removeFirstCompat()
             prefs.edit().putString(KEY, arr.toString()).apply()
             notifyChanged()
             true
