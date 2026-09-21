@@ -159,38 +159,57 @@ class MeetingRecordService : Service() {
         startTimeMs = System.currentTimeMillis()
         segmentCounter = 0
 
-        noteSession = NoteSession(
-            applicationContext,
-            "meeting"
-        )
-
-        transcriptFile = noteSession?.file
-
-        transcriptFile?.absolutePath?.let { path ->
-            getSharedPreferences("whisper", MODE_PRIVATE)
-                .edit()
-                .putString("last_transcript_path", path)
-                .apply()
-        }
-
-        wavWriter = if (saveAudio) {
-            noteSession?.file?.let { txt ->
-                try {
-                    PcmWavWriter(File(txt.parent, txt.nameWithoutExtension + ".wav"))
-                } catch (e: Exception) {
-                    Log.e(TAG, "wav writer failed: ${e.message}")
-                    null
-                }
-            }
-        } else null
-
         try {
-            if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire()
+            noteSession = NoteSession(
+                applicationContext,
+                "meeting"
+            )
+
+            transcriptFile = noteSession?.file
+
+            transcriptFile?.absolutePath?.let { path ->
+                getSharedPreferences("whisper", MODE_PRIVATE)
+                    .edit()
+                    .putString("last_transcript_path", path)
+                    .apply()
             }
-        } catch (_: Exception) {}
-        startForeground(NOTIFICATION_ID, buildNotification("Starting... (screen may lock, still recording)"))
-        Log.i(TAG, "Meeting started: mode=$mode model=$model lang=$lang - WakeLock held, will survive lock screen")
+
+            wavWriter = if (saveAudio) {
+                noteSession?.file?.let { txt ->
+                    try {
+                        PcmWavWriter(File(txt.parent, txt.nameWithoutExtension + ".wav"))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "wav writer failed: ${e.message}")
+                        null
+                    }
+                }
+            } else null
+
+            try {
+                if (wakeLock?.isHeld == false) {
+                    wakeLock?.acquire()
+                }
+            } catch (_: Exception) {}
+            startForeground(NOTIFICATION_ID, buildNotification("Starting... (screen may lock, still recording)"))
+            Log.i(TAG, "Meeting started: mode=$mode model=$model lang=$lang - WakeLock held, will survive lock screen")
+        } catch (e: Exception) {
+            // Setup failed after mic acquire (e.g. storage I/O, FGS start):
+            // release everything so state and mic never get stuck.
+            Log.e(TAG, "Meeting setup failed: ${e.message}", e)
+            try { wavWriter?.close() } catch (_: Exception) {}
+            wavWriter = null
+            noteSession = null
+            transcriptFile = null
+            MicSessionManager.release(MicOwner.MEETING)
+            serviceState = ServiceState.IDLE
+            isRecording = false
+            isServiceRecording = false
+            try {
+                android.widget.Toast.makeText(this, "Meeting failed to start: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {}
+            try { stopSelf() } catch (_: Exception) {}
+            return
+        }
 
         recordThread = Thread {
             var pcmChunk = ByteArrayOutputStream()
@@ -407,6 +426,8 @@ class MeetingRecordService : Service() {
             serviceState == ServiceState.STOPPING ||
             serviceState == ServiceState.PROCESSING
         ) {
+            // Nothing to stop: ensure no empty service lingers.
+            try { stopSelf() } catch (_: Exception) {}
             return
         }
 

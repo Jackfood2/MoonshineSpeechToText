@@ -227,6 +227,7 @@ class MainActivity : AppCompatActivity() {
 
         tvLiveTranscript.setTextIsSelectable(true)
         tvLiveTranscript.isLongClickable = true
+        btnStopMeeting.isEnabled = false
         tvQueue = findViewById(R.id.tvQueue)
         progressTranscribe = findViewById(R.id.progressTranscribe)
         radioMode = findViewById(R.id.radioMode)

@@ -266,29 +266,40 @@ class QuickSwitchService : Service() {
             toast("Microphone is busy")
             return
         }
-        ensureWhisperActive() // best effort so delivery can type directly
-        // start recording NOW; load the model concurrently (first chunk waits in queue)
-        if (!MoonshineEngine.isLoaded(model)) {
-            Thread {
-                MoonshineEngine.applyThreadPref(this)
-                MoonshineEngine.ensureModel(this, model, prefs.getString("lang", "auto") ?: "auto")
-            }.apply { isDaemon = true; name = "bubble-model-load"; start() }
+        val lang: String
+        val pcmChunk: ByteArrayOutputStream
+        val wakeLock: android.os.PowerManager.WakeLock
+        try {
+            ensureWhisperActive() // best effort so delivery can type directly
+            // start recording NOW; load the model concurrently (first chunk waits in queue)
+            if (!MoonshineEngine.isLoaded(model)) {
+                Thread {
+                    MoonshineEngine.applyThreadPref(this)
+                    MoonshineEngine.ensureModel(this, model, prefs.getString("lang", "auto") ?: "auto")
+                }.apply { isDaemon = true; name = "bubble-model-load"; start() }
+            }
+            sessionHadVoice = false
+            chunksSent = 0
+            recStartTs = System.currentTimeMillis()
+            recActive = true
+            setState(STATE_REC, null)
+            toast("Recording started - tap to stop")
+            refreshNotif(true) // notification must reflect REC immediately (timer starts from here)
+            AppLog.i("Bubble", "recording started")
+            // keep CPU alive while locked so recording never stalls
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Whisper:BubbleRec")
+            wakeLock.acquire(30 * 60 * 1000L)
+            lang = prefs.getString("lang", "auto") ?: "auto"
+            // per-session buffer: a fast stop/start must never share audio with the dying session
+            pcmChunk = ByteArrayOutputStream()
+        } catch (e: Exception) {
+            // Setup failed after mic acquire: release so the mic never gets stuck.
+            MicSessionManager.release(MicOwner.BUBBLE)
+            AppLog.e("Bubble", "recording setup failed: ${e.message}")
+            toast("Recording failed to start")
+            return
         }
-        sessionHadVoice = false
-        chunksSent = 0
-        recStartTs = System.currentTimeMillis()
-        recActive = true
-        setState(STATE_REC, null)
-        toast("Recording started - tap to stop")
-        refreshNotif(true) // notification must reflect REC immediately (timer starts from here)
-        AppLog.i("Bubble", "recording started")
-        // keep CPU alive while locked so recording never stalls
-        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        val wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Whisper:BubbleRec")
-        wakeLock.acquire(30 * 60 * 1000L)
-        val lang = prefs.getString("lang", "auto") ?: "auto"
-        // per-session buffer: a fast stop/start must never share audio with the dying session
-        val pcmChunk = ByteArrayOutputStream()
         // threads hand off cleanly: new session waits for the old one to finish its final flush
         val prevThread = recThread
         sessionGen++ // invalidate stale watchers from previous sessions
