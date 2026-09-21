@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Build
-import android.os.Environment
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -15,24 +14,37 @@ import androidx.core.app.NotificationCompat
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class MeetingRecordService : Service() {
 
-    private companion object {
+    enum class ServiceState {
+        IDLE,
+        STARTING,
+        RECORDING,
+        STOPPING,
+        PROCESSING
+    }
+
+    companion object { // Removed 'private' so MainActivity can access it
         const val TAG = "MeetingService"
         const val CHANNEL_ID = "whisper_meeting"
         const val NOTIFICATION_ID = 101
-        // Gold standard VAD chunk - matches desktop main.py _build_vad_chunks target 20s max 28s min 10s
-        // No word cut, no overlap/dup, boundaries at silence
-        const val TARGET_CHUNK_MS = 20_000L
-        const val MIN_CHUNK_MS = 10_000L
-        const val MAX_CHUNK_MS = 28_000L
-        const val CHUNK_DURATION_MS = 30_000L // legacy fallback
-        const val SILENCE_RMS_THRESHOLD = 0.015  // ~ -36dB, matches librosa top_db 28
-        const val SILENCE_MIN_MS = 300L
+
+        // Chunk rule: 30-59.9s + 2s silence = close; 60s = force-close.
+        const val MIN_CHUNK_MS = 30_000L
+        const val MAX_CHUNK_MS = 60_000L
+        const val SILENCE_MIN_MS = 2_000L
+        const val MIN_CHUNK_BYTES = 8_000
+
+        const val SILENCE_RMS_THRESHOLD = 0.015
+
+        @Volatile
+        var serviceState: ServiceState = ServiceState.IDLE
+            private set
+
+        @Volatile
+        var isServiceRecording = false
+            private set
     }
 
     @Volatile private var isRecording = false
@@ -43,7 +55,11 @@ class MeetingRecordService : Service() {
     private var mode = "txt"  // "txt" = save clean text file, "type" = commit to focused input
     private var transcriptFile: File? = null
     private var segmentCounter = 0
-    private val allText = StringBuilder()
+    private var noteSession: NoteSession? = null
+    private var saveAudio = false
+    private var wavWriter: PcmWavWriter? = null
+    @Volatile
+    private var activeRecorder: android.media.AudioRecord? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private val flushExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "meeting-flush").apply { isDaemon = true } }
 
@@ -60,13 +76,18 @@ class MeetingRecordService : Service() {
                 model = intent.getStringExtra("model") ?: "small"
                 lang = intent.getStringExtra("lang") ?: "auto"
                 mode = intent.getStringExtra("mode") ?: "txt"
+                saveAudio =
+                    intent.getBooleanExtra(
+                        "save_audio",
+                        false
+                    )
                 startMeeting()
             }
             "STOP" -> {
                 stopMeeting()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun createNotificationChannel() {
@@ -109,192 +130,452 @@ class MeetingRecordService : Service() {
     }
 
     private fun startMeeting() {
-        if (isRecording) return
-        // H5: enforce mic mutual exclusion - don't start if other recorder active
-        if (TranscriptionQueue.isActive()) {
-            Log.w(TAG, "Mic busy - TranscriptionQueue active, not starting meeting")
+        if (serviceState != ServiceState.IDLE) {
+            Log.w(TAG, "Start ignored because state=$serviceState")
+            return
+        }
+
+        serviceState = ServiceState.STARTING
+        if (!MicSessionManager.tryAcquire(MicOwner.MEETING)) {
+            serviceState = ServiceState.IDLE
+            Log.w(TAG, "Microphone currently owned by another recorder")
             try {
-                android.widget.Toast.makeText(this, "Mic busy - queue processing", android.widget.Toast.LENGTH_SHORT).show()
+                android.widget.Toast.makeText(this, "Microphone is busy", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+            return
+        }
+        // Storage guard: 8h WAV ~= 900MB when saving audio, else queue scratch only
+        val estimatedBytes = if (saveAudio) 1_000_000_000L else 200_000_000L
+        if (!hasEnoughStorage(applicationContext, estimatedBytes)) {
+            MicSessionManager.release(MicOwner.MEETING)
+            serviceState = ServiceState.IDLE
+            Log.w(TAG, "Not enough free storage for recording")
+            try {
+                android.widget.Toast.makeText(this, "Not enough free storage for recording", android.widget.Toast.LENGTH_LONG).show()
             } catch (_: Exception) {}
             return
         }
         isRecording = true
         startTimeMs = System.currentTimeMillis()
         segmentCounter = 0
-        allText.clear()
 
-        val fmt = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US)
-        val baseName = "meeting_${fmt.format(Date())}"
+        noteSession = NoteSession(
+            applicationContext,
+            "meeting"
+        )
 
-        if (mode == "txt") {
-            val docsDir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
-                "WhisperNotes"
-            )
-            if (!docsDir.exists()) docsDir.mkdirs()
+        transcriptFile = noteSession?.file
 
-            transcriptFile = File(docsDir, "$baseName.txt")
-            transcriptFile?.writeText("")
+        transcriptFile?.absolutePath?.let { path ->
+            getSharedPreferences("whisper", MODE_PRIVATE)
+                .edit()
+                .putString("last_transcript_path", path)
+                .apply()
         }
 
-        try { if (wakeLock?.isHeld == false) wakeLock?.acquire(4*60*60*1000L) } catch (_: Exception) {}
+        wavWriter = if (saveAudio) {
+            noteSession?.file?.let { txt ->
+                try {
+                    PcmWavWriter(File(txt.parent, txt.nameWithoutExtension + ".wav"))
+                } catch (e: Exception) {
+                    Log.e(TAG, "wav writer failed: ${e.message}")
+                    null
+                }
+            }
+        } else null
+
+        try {
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire()
+            }
+        } catch (_: Exception) {}
         startForeground(NOTIFICATION_ID, buildNotification("Starting... (screen may lock, still recording)"))
         Log.i(TAG, "Meeting started: mode=$mode model=$model lang=$lang - WakeLock held, will survive lock screen")
 
         recordThread = Thread {
+            var pcmChunk = ByteArrayOutputStream()
+            var chunkStartTime = System.currentTimeMillis()
+            var silenceStartMs: Long? = null
+            var recorder: android.media.AudioRecord? = null
+
             try {
-                val recorder = AudioUtils.createRecorder(applicationContext)
+                recorder = AudioUtils.createRecorder(applicationContext)
+                activeRecorder = recorder
                 recorder.startRecording()
 
-                var pcmChunk = ByteArrayOutputStream()
-                var chunkStartTime = System.currentTimeMillis()
+                if (serviceState == ServiceState.STARTING) {
+                    isRecording = true
+                    isServiceRecording = true
+                    serviceState = ServiceState.RECORDING
+                } else {
+                    // Stop arrived while starting: release the recorder without recording.
+                    try { recorder.stop() } catch (_: Exception) {}
+                    isRecording = false
+                }
+
+                val buffer = ByteArray(4096)
                 var lastNotifUpdate = 0L
-                var silenceStartMs: Long? = null
-                var lastRms = 0.0
 
                 while (isRecording) {
-                    val buffer = ByteArray(4096)
-                    val read = recorder.read(buffer, 0, buffer.size)
-                    if (read > 0) {
-                        pcmChunk.write(buffer, 0, read)
-                        // track silence for VAD boundary
-                        lastRms = AudioUtils.rms16(buffer, read)
-                        if (lastRms < SILENCE_RMS_THRESHOLD) {
-                            if (silenceStartMs == null) silenceStartMs = System.currentTimeMillis()
-                        } else {
-                            silenceStartMs = null
+                    val read = try {
+                        recorder.read(buffer, 0, buffer.size)
+                    } catch (e: Exception) {
+                        if (isRecording) {
+                            Log.e(TAG, "Recorder read failed: ${e.message}")
                         }
+                        break
+                    }
+
+                    if (read <= 0) {
+                        if (!isRecording) break
+                        continue
+                    }
+
+                    pcmChunk.write(buffer, 0, read)
+
+                    try {
+                        wavWriter?.write(buffer, 0, read)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Full WAV write failed: ${e.message}")
                     }
 
                     val now = System.currentTimeMillis()
+                    val rms = AudioUtils.rms16(buffer, read)
 
-                    if (now - lastNotifUpdate > 1000) {
+                    if (rms < SILENCE_RMS_THRESHOLD) {
+                        if (silenceStartMs == null) {
+                            silenceStartMs = now
+                        }
+                    } else {
+                        silenceStartMs = null
+                    }
+
+                    if (now - lastNotifUpdate >= 1000L) {
                         lastNotifUpdate = now
-                        val elapsed = (now - startTimeMs) / 1000
-                        val min = elapsed / 60
-                        val sec = elapsed % 60
-                        val status = String.format("%02d:%02d | %s", min, sec, TranscriptionQueue.status())
-                        val nm = getSystemService(NotificationManager::class.java)
-                        nm.notify(NOTIFICATION_ID, buildNotification(status))
+
+                        val elapsed = (now - startTimeMs) / 1000L
+                        val min = elapsed / 60L
+                        val sec = elapsed % 60L
+
+                        val status = String.format(
+                            "%02d:%02d | %s",
+                            min,
+                            sec,
+                            TranscriptionQueue.status()
+                        )
+
+                        try {
+                            getSystemService(NotificationManager::class.java)
+                                .notify(
+                                    NOTIFICATION_ID,
+                                    buildNotification(status)
+                                )
+                        } catch (_: Exception) {
+                        }
+
+                        val queueBytes = TranscriptionQueue.pendingAudioBytes()
+                        if (queueBytes > 250L * 1024 * 1024) {
+                            AppLog.w(
+                                TAG,
+                                "Large pending audio queue: $queueBytes bytes"
+                            )
+                        }
                     }
 
                     val chunkElapsed = now - chunkStartTime
-                    val isSilence = silenceStartMs != null && (now - silenceStartMs!!) >= SILENCE_MIN_MS
-                    val shouldFlush = when {
-                        chunkElapsed >= MAX_CHUNK_MS && pcmChunk.size() > 8000 -> true // force at max 28s
-                        chunkElapsed >= TARGET_CHUNK_MS && isSilence && pcmChunk.size() > 8000 -> true // gold: at silence near 20s
-                        chunkElapsed >= CHUNK_DURATION_MS && pcmChunk.size() > 8000 -> true // legacy fallback 30s
-                        else -> false
-                    }
+                    val silenceDuration =
+                        silenceStartMs?.let { now - it } ?: 0L
+
+                    val shouldFlush =
+                        pcmChunk.size() >= MIN_CHUNK_BYTES &&
+                        (
+                            (
+                                chunkElapsed >= MIN_CHUNK_MS &&
+                                silenceDuration >= SILENCE_MIN_MS
+                            ) ||
+                            chunkElapsed >= MAX_CHUNK_MS
+                        )
+
                     if (shouldFlush) {
-                        val toFlush = pcmChunk
-                        flushExecutor.submit { flushChunk(toFlush, chunkStartTime) }
+                        val audio = pcmChunk
+                        val audioStart = chunkStartTime
+
                         pcmChunk = ByteArrayOutputStream()
                         chunkStartTime = now
                         silenceStartMs = null
+
+                        flushExecutor.submit {
+                            flushChunk(audio, audioStart)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Recording error: ${e.message}", e)
+            } finally {
+                try {
+                    recorder?.stop()
+                } catch (_: Exception) {
+                }
+                // shared recorder stays alive for bubble/keyboard (never release)
+                activeRecorder = null
+
+                // Manual stop must preserve a short final section.
+                if (pcmChunk.size() >= 4_000) {
+                    val finalAudio = pcmChunk
+                    val finalStart = chunkStartTime
+
+                    flushExecutor.submit {
+                        flushChunk(finalAudio, finalStart)
                     }
                 }
 
-                if (pcmChunk.size() > 4000) {
-                    val toFlush = pcmChunk
-                    flushExecutor.submit { flushChunk(toFlush, chunkStartTime) }
-                }
-
-                try {
-                    recorder.stop()
-                    // shared recorder stays alive for bubble/keyboard (never release)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Recorder stop error: ${e.message}")
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Recording error: ${e.message}")
+                Log.i(TAG, "Meeting recording thread finished")
             }
         }.apply {
             isDaemon = true
+            name = "meeting-recorder"
             start()
         }
     }
 
     private fun flushChunk(pcmData: ByteArrayOutputStream, chunkStartMs: Long) {
         try {
-            val pcmFile = File(cacheDir, "meeting_chunk_${System.currentTimeMillis()}.pcm")
+            val timestamp = System.currentTimeMillis()
+
+            val pcmFile =
+                File(cacheDir, "meeting_chunk_$timestamp.pcm")
             FileOutputStream(pcmFile).use { it.write(pcmData.toByteArray()) }
 
-            val wavFile = File(cacheDir, "meeting_chunk_${System.currentTimeMillis()}.wav")
+            val wavFile =
+                File(cacheDir, "meeting_chunk_$timestamp.wav")
             AudioUtils.pcmToWav(pcmFile, wavFile)
             pcmFile.delete()
 
             segmentCounter++
-            Log.i(TAG, "Flushing chunk #$segmentCounter, wav=${wavFile.length()} bytes")
+            // 16 kHz mono 16-bit PCM = 32,000 bytes/sec (matches AudioUtils.createRecorder).
+            val audioSeconds = pcmData.size().toDouble() / 32_000.0
+            Log.i(
+                TAG,
+                "Flushing chunk #$segmentCounter, " +
+                    "duration=${"%.1f".format(audioSeconds)}s, " +
+                    "wav=${wavFile.length()} bytes"
+            )
 
-            TranscriptionQueue.enqueue(
-                TranscriptionQueue.Job(
-                    context = applicationContext,
-                    wavFile = wavFile,
-                    model = model,
-                    lang = lang,
+            val job = TranscriptionQueue.Job(
+                context = applicationContext,
+                wavFile = wavFile,
+                model = model,
+                lang = lang,
                     onResult = { text ->
-                        if (text.isNotBlank()) {
-                            synchronized(this) {
-                                allText.append(text).append(" ")
+                        val cleaned = text.trim()
 
-                                if (mode == "txt" && transcriptFile != null) {
-                                    // Save clean text only (no timestamps)
-                                    transcriptFile!!.appendText("$text\n")
-                                    getSharedPreferences("whisper", MODE_PRIVATE)
-                                        .edit()
-                                        .putString("last_transcript_path", transcriptFile!!.absolutePath)
-                                        .apply()
-                                }
+                        if (
+                            cleaned.isNotEmpty() &&
+                            !AudioUtils.isNoSpeechText(cleaned)
+                        ) {
+                            // Always preserve and preview the transcript.
+                            noteSession?.append(cleaned)
+
+                            noteSession?.path()?.let { path ->
+                                getSharedPreferences("whisper", MODE_PRIVATE)
+                                    .edit()
+                                    .putString("last_transcript_path", path)
+                                    .apply()
+                            }
+
+                            // Type mode additionally sends the text to the focused input.
+                            if (mode == "type") {
+                                TextRouter.route(cleaned)
                             }
                         }
                     },
-                    onError = { error ->
-                        Log.e(TAG, "Chunk failed: $error")
-                    }
-                )
+                onError = { error ->
+                    Log.e(TAG, "Chunk failed: $error")
+                }
             )
+            if (!TranscriptionQueue.enqueue(job)) {
+                AppLog.e(TAG, "Unable to enqueue transcription chunk")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "flushChunk error: ${e.message}")
         }
     }
 
     private fun stopMeeting() {
-        if (!isRecording) {
-            stopSelf()
+        if (
+            serviceState == ServiceState.IDLE ||
+            serviceState == ServiceState.STOPPING ||
+            serviceState == ServiceState.PROCESSING
+        ) {
             return
         }
+
+        serviceState = ServiceState.STOPPING
         isRecording = false
-        Log.i(TAG, "Stopping meeting... (non-blocking)")
-        // show stopping state immediately - don't block main thread (ANR fix)
+        isServiceRecording = false
+
+        Log.i(TAG, "Stopping meeting and flushing final audio")
+
         try {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIFICATION_ID, buildNotification("Stopping - finishing queue..."))
-        } catch (_: Exception) {}
+            getSystemService(NotificationManager::class.java)
+                .notify(
+                    NOTIFICATION_ID,
+                    buildNotification(
+                        "Stopping microphone and saving final audio..."
+                    )
+                )
+        } catch (_: Exception) {
+        }
+
+        // Unblock a recorder.read() immediately.
+        try {
+            activeRecorder?.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "Recorder stop/unblock failed: ${e.message}")
+        }
+
         Thread {
-            try { recordThread?.join(10000) } catch (_: Exception) {}
-            var waitCount = 0
-            while (TranscriptionQueue.pendingCount() > 0 && waitCount < 30) {
-                try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
-                waitCount++
-                Log.i(TAG, "Waiting for queue... ($waitCount) pending=${TranscriptionQueue.pendingCount()}")
-            }
-            val path = transcriptFile?.absolutePath ?: "unknown"
-            Log.i(TAG, "Meeting saved: $path")
+            finishStoppingMeeting()
+        }.apply {
+            isDaemon = true
+            name = "meeting-stop"
+            start()
+        }
+    }
+
+    private fun finishStoppingMeeting() {
+        try {
+            /*
+             * Wait for the recording thread to reach finally and submit the
+             * final partial audio to flushExecutor.
+             */
             try {
-                val nm2 = getSystemService(NotificationManager::class.java)
-                nm2.cancel(NOTIFICATION_ID)
-            } catch (_: Exception) {}
-            try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-            try { stopSelf() } catch (_: Exception) {}
-        }.apply { isDaemon = true; start() }
+                recordThread?.join()
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+
+            recordThread = null
+
+            try {
+                wavWriter?.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "Full WAV close failed: ${e.message}")
+            }
+
+            wavWriter = null
+
+            /*
+             * Because flushExecutor has one worker, this barrier completes only
+             * after every earlier flushChunk task has finished enqueueing.
+             */
+            try {
+                flushExecutor.submit {
+                    Log.i(TAG, "Meeting flush barrier reached")
+                }.get()
+            } catch (e: Exception) {
+                Log.e(TAG, "Meeting flush barrier failed: ${e.message}")
+            }
+
+            serviceState = ServiceState.PROCESSING
+
+            try {
+                getSystemService(NotificationManager::class.java)
+                    .notify(
+                        NOTIFICATION_ID,
+                        buildNotification(
+                            "Transcribing and saving remaining audio..."
+                        )
+                    )
+            } catch (_: Exception) {
+            }
+
+            /*
+             * Stop and Save means complete processing. If the queue was paused,
+             * resume it so saving cannot wait forever.
+             */
+            if (TranscriptionQueue.isPaused()) {
+                Log.i(TAG, "Resuming paused queue to complete Stop and Save")
+                TranscriptionQueue.resume()
+            }
+
+            while (TranscriptionQueue.isActive()) {
+                try {
+                    Thread.sleep(250L)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+
+            /*
+             * Type mode may still be waiting to deliver the final result.
+             * The saved note itself is already complete at this point, so do not
+             * block meeting completion indefinitely on input delivery.
+             */
+            val path = transcriptFile?.absolutePath.orEmpty()
+
+            if (path.isNotEmpty()) {
+                getSharedPreferences("whisper", MODE_PRIVATE)
+                    .edit()
+                    .putString("last_transcript_path", path)
+                    .apply()
+            }
+
+            Log.i(TAG, "Meeting fully saved: $path")
+        } catch (e: Exception) {
+            Log.e(TAG, "Meeting completion failed: ${e.message}", e)
+        } finally {
+            MicSessionManager.release(MicOwner.MEETING)
+
+            try {
+                if (wakeLock?.isHeld == true) {
+                    wakeLock?.release()
+                }
+            } catch (_: Exception) {
+            }
+
+            try {
+                getSystemService(NotificationManager::class.java)
+                    .cancel(NOTIFICATION_ID)
+            } catch (_: Exception) {
+            }
+
+            serviceState = ServiceState.IDLE
+
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Exception) {
+            }
+
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
+        try { wavWriter?.close() } catch (_: Exception) {}
+        wavWriter = null
+        MicSessionManager.release(MicOwner.MEETING)
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+        serviceState = ServiceState.IDLE
+        isServiceRecording = false
         super.onDestroy()
+    }
+
+    fun hasEnoughStorage(
+        context: android.content.Context,
+        requiredBytes: Long
+    ): Boolean {
+
+        val stat =
+            android.os.StatFs(
+                context.filesDir.absolutePath
+            )
+
+        val available =
+            stat.availableBytes
+
+        return available >= requiredBytes
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

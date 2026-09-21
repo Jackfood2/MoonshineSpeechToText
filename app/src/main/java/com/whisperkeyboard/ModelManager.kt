@@ -11,12 +11,12 @@ import java.io.File
  */
 object ModelManager {
 
-    // Human-readable sizes for UI (approx on-disk after download)
+    // Human-readable sizes for UI (approximate downloaded model size, not RAM usage)
     private fun sizeFor(model: String): String = when (model) {
-        "tiny" -> "~34 MB (tiny-streaming, Moonshine v2)"
-        "base" -> "~60 MB (base-streaming)"
-        "small" -> "~123 MB (small-streaming, v2)"
-        "medium" -> "~245 MB (medium-streaming, v2, best accuracy)"
+        "tiny" -> "~34 MB download • RAM usage varies (tiny-streaming, Moonshine v2)"
+        "base" -> "~60 MB download • RAM usage varies (base-streaming)"
+        "small" -> "~123 MB download • RAM usage varies (small-streaming, v2)"
+        "medium" -> "~245 MB download • RAM usage varies (medium-streaming, v2, best accuracy)"
         else -> "unknown"
     }
 

@@ -30,7 +30,8 @@
         <!-- Meeting -->
         <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="12dp" app:cardElevation="2dp" app:cardBackgroundColor="#FFFFFF" android:layout_marginTop="12dp" app:strokeColor="#E0E0E0" app:strokeWidth="1dp">
             <LinearLayout android:orientation="vertical" android:layout_width="match_parent" android:layout_height="wrap_content" android:padding="14dp">
-                <TextView android:text="Meeting Recording (survives lock screen)" android:textStyle="bold" android:textSize="14sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                <TextView android:text="Live Transcription" android:textStyle="bold" android:textSize="14sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                <TextView android:text="Recording continues when screen is locked.&#10;• Transcription is appended progressively&#10;• Audio is deleted after processing unless saved&#10;• Recording can run for several hours" android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="4dp"/>
                 <RadioGroup android:id="@+id/radioMode" android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp">
                     <RadioButton android:id="@+id/radioTxt" android:text="Save as TXT" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1" android:checked="true"/>
                     <RadioButton android:id="@+id/radioType" android:text="Type into focus" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1"/>
@@ -39,8 +40,13 @@
                     <com.google.android.material.button.MaterialButton android:id="@+id/btnStartMeeting" android:text="Start" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"/>
                     <com.google.android.material.button.MaterialButton android:id="@+id/btnStopMeeting" android:text="Stop &amp; Save" style="@style/Widget.Material3.Button.OutlinedButton" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:layout_marginStart="8dp"/>
                 </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchSaveAudio" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Save recording audio" android:textSize="13sp" android:layout_marginTop="6dp"/>
+                <TextView android:text="Audio OFF = chunks deleted after transcription. ON = full WAV kept (~115 MB/hour, ~900 MB for 8 hours)." android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="2dp"/>
                 <TextView android:id="@+id/tvMeetingStatus" android:text="Idle" android:textSize="13sp" android:textColor="#212121" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
                 <TextView android:id="@+id/tvMeetingPath" android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                <androidx.core.widget.NestedScrollView android:id="@+id/transcriptScrollView" android:layout_width="match_parent" android:layout_height="220dp" android:layout_marginTop="6dp" android:background="#F5F5F5" android:fillViewport="true" android:nestedScrollingEnabled="true" android:scrollbars="vertical">
+                    <TextView android:id="@+id/tvLiveTranscript" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="220dp" android:padding="10dp" android:text="Live transcript appears here..." android:textColor="#212121" android:textIsSelectable="true" android:longClickable="true" android:focusable="true" android:focusableInTouchMode="true" android:textSize="14sp" android:lineSpacingExtra="3dp"/>
+                </androidx.core.widget.NestedScrollView>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

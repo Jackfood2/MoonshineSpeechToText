@@ -33,8 +33,8 @@ class ImeRecordService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, "whisper_ime")
-            .setContentTitle("Whisper - recording voice typing")
-            .setContentText("Recording continues on lock screen")
+            .setContentTitle("Moonshine keyboard recording")
+            .setContentText("Keyboard recording stops when screen locks")
             .setSmallIcon(android.R.drawable.presence_audio_online)
             .setOngoing(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -43,7 +43,21 @@ class ImeRecordService : Service() {
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            "START" -> startForeground(102, notif())
+            "START" -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        102,
+                        notif(),
+                        android.content.pm.ServiceInfo
+                            .FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    )
+                } else {
+                    startForeground(
+                        102,
+                        notif()
+                    )
+                }
+            }
             "STOP_RECORDING" -> {
                 // from the notification Stop button (works on lock screen):
                 // end the recording; queued chunks keep processing in background

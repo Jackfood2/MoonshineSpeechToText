@@ -46,6 +46,8 @@
                     <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchVad" android:text="VAD auto-stop" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:checked="true"/>
                     <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchLive" android:text="LIVE typing" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:checked="true"/>
                 </LinearLayout>
+                <TextView android:text="Live transcription interval" android:textStyle="bold" android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10dp"/>
+                <Spinner android:id="@+id/spinnerLiveInterval" android:layout_width="match_parent" android:layout_height="52dp" android:minHeight="52dp"/>
                 <LinearLayout android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp">
                     <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchBt" android:text="Bluetooth mic" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"/>
                     <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switchCaps" android:text="Auto caps" android:textSize="13sp" android:textColor="#212121" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:checked="true"/>
@@ -64,12 +66,12 @@
                     <SeekBar android:id="@+id/seekChunkSilence" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:max="19"/>
                     <TextView android:id="@+id/tvChunkSilence" android:text="4.5s" android:textStyle="bold" android:textColor="#212121" android:textSize="13sp" android:layout_width="52dp" android:layout_height="wrap_content" android:gravity="end"/>
                 </LinearLayout>
-                <TextView android:text="Chunk length (grows automatically while previous chunk is still processing)" android:textStyle="bold" android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+                <TextView android:text="Chunk length: keyboard cuts only after 30s at 2s silence (max 60s). Applies to bubble target." android:textStyle="bold" android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
                 <LinearLayout android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
                     <SeekBar android:id="@+id/seekChunkLength" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:min="1" android:max="45"/>
                     <TextView android:id="@+id/tvChunkLength" android:text="30s" android:textStyle="bold" android:textColor="#212121" android:textSize="13sp" android:layout_width="52dp" android:layout_height="wrap_content" android:gravity="end"/>
                 </LinearLayout>
-                <TextView android:text="Auto-stop recording after silence (VAD ON)" android:textStyle="bold" android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
+                <TextView android:text="Keyboard auto-stop: ends the whole recording session after silence (VAD ON). Chunk cuts use a fixed 2s boundary." android:textStyle="bold" android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
                 <LinearLayout android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
                     <SeekBar android:id="@+id/seekStopSilence" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:min="5" android:max="60"/>
                     <TextView android:id="@+id/tvStopSilence" android:text="10s" android:textStyle="bold" android:textColor="#212121" android:textSize="13sp" android:layout_width="52dp" android:layout_height="wrap_content" android:gravity="end"/>
@@ -80,7 +82,7 @@
                     <TextView android:id="@+id/tvUnloadIdle" android:text="60s" android:textStyle="bold" android:textColor="#212121" android:textSize="13sp" android:layout_width="64dp" android:layout_height="wrap_content" android:gravity="end"/>
                 </LinearLayout>
                 <TextView android:text="Chunked ON = text appears progressively. OFF = whole recording processed once on Stop. Applies to next recording." android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="4dp"/>
-                <TextView android:text="VAD: silence 1.3s → auto Stop. LIVE: composing preview while speaking. BT: VOICE_COMMUNICATION." android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
+                <TextView android:text="VAD: silence splits chunks (meeting never auto-stops). LIVE TRANSCRIPTION: transcribes new audio every X seconds and appends the result to the current note. BT: VOICE_COMMUNICATION." android:textSize="12sp" android:textColor="#424242" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

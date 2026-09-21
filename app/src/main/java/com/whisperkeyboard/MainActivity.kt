@@ -14,19 +14,187 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import com.google.android.material.switchmaterial.SwitchMaterial
 import androidx.core.content.ContextCompat
+import androidx.core.widget.NestedScrollView
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.RandomAccessFile
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var tvMeetingStatus: TextView
     private lateinit var tvMeetingPath: TextView
     private lateinit var tvQueue: TextView
+    private lateinit var tvLiveTranscript: TextView
     private lateinit var progressTranscribe: ProgressBar
     private lateinit var radioMode: RadioGroup
+    private lateinit var transcriptScrollView: NestedScrollView
+    private lateinit var btnStartMeeting: Button
+    private lateinit var btnStopMeeting: Button
+
+    private var previewPath: String? = null
+    private var shownTranscriptBytes = 0L
+    private var pendingPartialBytes = ByteArray(0)
+    private var wasMeetingBusy = false
+    private val previewText =
+        android.text.SpannableStringBuilder()
+
+    fun addLiveLine(text: String) {
+        appendPreviewText(if (text.endsWith("\n")) text else "$text\n")
+    }
+
+    private fun resetPreview() {
+        previewText.clear()
+        pendingPartialBytes = ByteArray(0)
+        shownTranscriptBytes = 0L
+        tvLiveTranscript.text = ""
+    }
+
+    private fun isTranscriptNearBottom(): Boolean {
+        val child = transcriptScrollView.getChildAt(0) ?: return true
+
+        val remaining =
+            child.height -
+            (
+                transcriptScrollView.height +
+                transcriptScrollView.scrollY
+            )
+
+        return remaining <= 120
+    }
+
+    private fun scrollTranscriptToBottom() {
+        transcriptScrollView.post {
+            transcriptScrollView.fullScroll(
+                android.view.View.FOCUS_DOWN
+            )
+        }
+    }
+
+    private fun appendPreviewText(text: String) {
+        if (text.isEmpty()) return
+
+        val followBottom = isTranscriptNearBottom()
+
+        previewText.append(text)
+        tvLiveTranscript.append(text)
+
+        if (followBottom) {
+            scrollTranscriptToBottom()
+        }
+    }
+
+    private fun updateLivePreview(path: String) {
+        try {
+            val file = File(path)
+            if (!file.exists()) return
+
+            if (previewPath != path) {
+                previewPath = path
+                resetPreview()
+            }
+
+            val currentLength = file.length()
+
+            // Same file was externally truncated or recreated.
+            if (currentLength < shownTranscriptBytes) {
+                resetPreview()
+            }
+
+            if (currentLength == shownTranscriptBytes) {
+                return
+            }
+
+            RandomAccessFile(file, "r").use { raf ->
+                raf.seek(shownTranscriptBytes)
+
+                while (shownTranscriptBytes < currentLength) {
+                    val remaining =
+                        currentLength - shownTranscriptBytes
+
+                    val wanted =
+                        minOf(remaining, 64L * 1024L).toInt()
+
+                    val buffer = ByteArray(wanted)
+                    val read = raf.read(buffer)
+
+                    if (read <= 0) break
+
+                    shownTranscriptBytes += read
+
+                    val actual =
+                        if (read == buffer.size) {
+                            buffer
+                        } else {
+                            buffer.copyOf(read)
+                        }
+
+                    appendPreviewBytes(actual)
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(
+                "MainActivity",
+                "Preview update failed: ${e.message}"
+            )
+        }
+    }
+
+    private fun appendPreviewBytes(newBytes: ByteArray) {
+        val combined =
+            ByteArray(pendingPartialBytes.size + newBytes.size)
+
+        System.arraycopy(
+            pendingPartialBytes,
+            0,
+            combined,
+            0,
+            pendingPartialBytes.size
+        )
+
+        System.arraycopy(
+            newBytes,
+            0,
+            combined,
+            pendingPartialBytes.size,
+            newBytes.size
+        )
+
+        var lastNewline = -1
+
+        for (index in combined.indices.reversed()) {
+            if (combined[index] == '\n'.code.toByte()) {
+                lastNewline = index
+                break
+            }
+        }
+
+        if (lastNewline < 0) {
+            pendingPartialBytes = combined
+            return
+        }
+
+        val completed =
+            combined.copyOfRange(
+                0,
+                lastNewline + 1
+            )
+
+        pendingPartialBytes =
+            combined.copyOfRange(
+                lastNewline + 1,
+                combined.size
+            )
+
+        val text = completed.toString(Charsets.UTF_8)
+
+        appendPreviewText(text)
+    }
 
     private val permRequestCode = 100
 
@@ -52,6 +220,13 @@ class MainActivity : AppCompatActivity() {
 
         tvMeetingStatus = findViewById(R.id.tvMeetingStatus)
         tvMeetingPath = findViewById(R.id.tvMeetingPath)
+        tvLiveTranscript = findViewById(R.id.tvLiveTranscript)
+        transcriptScrollView = findViewById(R.id.transcriptScrollView)
+        btnStartMeeting = findViewById(R.id.btnStartMeeting)
+        btnStopMeeting = findViewById(R.id.btnStopMeeting)
+
+        tvLiveTranscript.setTextIsSelectable(true)
+        tvLiveTranscript.isLongClickable = true
         tvQueue = findViewById(R.id.tvQueue)
         progressTranscribe = findViewById(R.id.progressTranscribe)
         radioMode = findViewById(R.id.radioMode)
@@ -95,32 +270,99 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        findViewById<Button>(R.id.btnStartMeeting).setOnClickListener {
-            if (!hasPermissions()) { requestPermissions(); return@setOnClickListener }
-            val prefs = getSharedPreferences("whisper", MODE_PRIVATE)
-            val lang = prefs.getString("lang", "auto") ?: "auto"
-            val model = prefs.getString("model", "small") ?: "small"
-            val mode = if (radioMode.checkedRadioButtonId == R.id.radioType) "type" else "txt"
-            val intent = Intent(this, MeetingRecordService::class.java)
-            intent.action = "START"
-            intent.putExtra("model", model)
-            intent.putExtra("lang", lang)
-            intent.putExtra("mode", mode)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
-            tvMeetingStatus.text = "Recording ($mode mode)... tap Stop (continues with screen off)"
-            Toast.makeText(this, "Meeting recording started ($mode)", Toast.LENGTH_SHORT).show()
+        val swSaveAudio = findViewById<SwitchMaterial>(R.id.switchSaveAudio)
+        swSaveAudio.isChecked = getSharedPreferences("whisper", MODE_PRIVATE).getBoolean("save_audio", false)
+        swSaveAudio.setOnCheckedChangeListener { _, b ->
+            getSharedPreferences("whisper", MODE_PRIVATE).edit().putBoolean("save_audio", b).apply()
+            Toast.makeText(this, if (b) "Meeting audio will be saved (large files)" else "Meeting audio deleted after transcription", Toast.LENGTH_SHORT).show()
         }
 
-        findViewById<Button>(R.id.btnStopMeeting).setOnClickListener {
-            val intent = Intent(this, MeetingRecordService::class.java)
-            intent.action = "STOP"
+        btnStartMeeting.setOnClickListener {
+            if (!hasPermissions()) {
+                requestPermissions()
+                return@setOnClickListener
+            }
+
+            btnStartMeeting.isEnabled = false
+            btnStopMeeting.isEnabled = false
+            tvMeetingStatus.text = "Starting microphone..."
+
+            val prefs =
+                getSharedPreferences("whisper", MODE_PRIVATE)
+
+            val lang =
+                prefs.getString("lang", "auto") ?: "auto"
+
+            val model =
+                prefs.getString("model", "small") ?: "small"
+
+            val mode =
+                if (
+                    radioMode.checkedRadioButtonId ==
+                    R.id.radioType
+                ) {
+                    "type"
+                } else {
+                    "txt"
+                }
+
+            val saveAudio =
+                prefs.getBoolean("save_audio", false)
+
+            val intent =
+                Intent(
+                    this,
+                    MeetingRecordService::class.java
+                ).apply {
+                    action = "START"
+                    putExtra("model", model)
+                    putExtra("lang", lang)
+                    putExtra("mode", mode)
+                    putExtra("save_audio", saveAudio)
+                }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        }
+
+        btnStopMeeting.setOnClickListener {
+            btnStartMeeting.isEnabled = false
+            btnStopMeeting.isEnabled = false
+
+            tvMeetingStatus.text =
+                "Stopping and saving final transcription..."
+
+            val intent =
+                Intent(
+                    this,
+                    MeetingRecordService::class.java
+                ).apply {
+                    action = "STOP"
+                }
+
             startService(intent)
-            tvMeetingStatus.text = "Stopping... transcript saving (wait for queue)"
-            Toast.makeText(this, "Stopping - transcript will be saved to Documents/WhisperNotes", Toast.LENGTH_LONG).show()
         }
 
         findViewById<Button>(R.id.btnDonate).setOnClickListener {
-            try { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.paypal.com/paypalme/jackfood2004"))) } catch (_: Exception) { Toast.makeText(this, "PayPal: jackfood2004@gmail.com", Toast.LENGTH_LONG).show() }
+            try {
+                val uri =
+                    android.net.Uri.parse(
+                        "https://www.paypal.com/paypalme/jackfood2004"
+                    )
+
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, uri)
+                )
+            } catch (_: Exception) {
+                Toast.makeText(
+                    this,
+                    "PayPal: jackfood2004@gmail.com",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
         findViewById<Button>(R.id.btnPrivacy).setOnClickListener { startActivity(Intent(this, PrivacyDashboardActivity::class.java)) }
         findViewById<Button>(R.id.btnPauseQueue).setOnClickListener {
@@ -142,26 +384,78 @@ class MainActivity : AppCompatActivity() {
 
         requestPermissions()
 
-        // preload last-used model (Moonshine)
+        // On-demand model policy: do NOT auto-load on app start (battery/RAM).
+        // Model loads when the keyboard is entered, on first keyboard switch,
+        // or when a meeting starts.
         val prefs = getSharedPreferences("whisper", MODE_PRIVATE)
-        val lastModel = prefs.getString("model", "small") ?: "small"
-        lifecycleScope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    if (!MoonshineEngine.isLoaded(lastModel)) {
-                        MoonshineEngine.ensureModel(applicationContext, lastModel, prefs.getString("lang","en") ?: "en")
-                    }
-                }
-            } catch (_: Throwable) {}
-        }
 
         lifecycleScope.launch {
-            while (true) {
+            while (isActive) {
                 kotlinx.coroutines.delay(800)
                 withContext(Dispatchers.Main) {
                     tvQueue.text = TranscriptionQueue.status()
+
+                    val state =
+                        MeetingRecordService.serviceState
+
+                    val queueBusy =
+                        TranscriptionQueue.isActive()
+
+                    when (state) {
+                        MeetingRecordService.ServiceState.STARTING -> {
+                            btnStartMeeting.isEnabled = false
+                            btnStopMeeting.isEnabled = false
+                            tvMeetingStatus.text = "Starting microphone..."
+                            wasMeetingBusy = true
+                        }
+
+                        MeetingRecordService.ServiceState.RECORDING -> {
+                            btnStartMeeting.isEnabled = false
+                            btnStopMeeting.isEnabled = true
+                            tvMeetingStatus.text =
+                                "Recording... tap Stop and Save when finished"
+                            wasMeetingBusy = true
+                        }
+
+                        MeetingRecordService.ServiceState.STOPPING -> {
+                            btnStartMeeting.isEnabled = false
+                            btnStopMeeting.isEnabled = false
+                            tvMeetingStatus.text =
+                                "Stopping microphone and flushing final audio..."
+                            wasMeetingBusy = true
+                        }
+
+                        MeetingRecordService.ServiceState.PROCESSING -> {
+                            btnStartMeeting.isEnabled = false
+                            btnStopMeeting.isEnabled = false
+                            tvMeetingStatus.text =
+                                "Transcribing remaining audio... please wait"
+                            wasMeetingBusy = true
+                        }
+
+                        MeetingRecordService.ServiceState.IDLE -> {
+                            btnStartMeeting.isEnabled = !queueBusy
+                            btnStopMeeting.isEnabled = false
+
+                            if (queueBusy) {
+                                tvMeetingStatus.text =
+                                    "Processing transcription queue..."
+                            } else if (wasMeetingBusy) {
+                                tvMeetingStatus.text =
+                                    "Saved. Ready to record again."
+                                wasMeetingBusy = false
+                            } else {
+                                tvMeetingStatus.text =
+                                    "Ready to record"
+                            }
+                        }
+                    }
+
                     val lastPath = prefs.getString("last_transcript_path", "")
-                    if (!lastPath.isNullOrEmpty()) tvMeetingPath.text = "Last: $lastPath"
+                    if (!lastPath.isNullOrEmpty()) {
+                        tvMeetingPath.text = "Last: $lastPath"
+                        updateLivePreview(lastPath)
+                    }
                 }
             }
         }

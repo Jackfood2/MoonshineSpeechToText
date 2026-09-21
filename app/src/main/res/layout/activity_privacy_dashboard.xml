@@ -4,7 +4,7 @@
     android:layout_width="match_parent" android:layout_height="match_parent" android:background="#FAFAFA" android:padding="12dp">
 <LinearLayout android:orientation="vertical" android:layout_width="match_parent" android:layout_height="wrap_content">
     <TextView android:text="Privacy Dashboard &amp; Logs" android:textSize="22sp" android:textStyle="bold" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
-    <TextView android:text="100% on-device. No cloud. Audio deleted after transcription (cache). Models auto-cleared on uninstall." android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="12dp"/>
+    <TextView android:text="On-device transcription. Temporary audio chunks are deleted after successful transcription unless &quot;Save audio&quot; is enabled. Saved recordings remain in WhisperNotes until deleted by the user." android:textSize="13sp" android:textColor="#212121" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="12dp"/>
 
     <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="12dp" app:cardElevation="2dp" app:cardBackgroundColor="#FFFFFF" app:strokeColor="#E0E0E0" app:strokeWidth="1dp" android:layout_marginBottom="12dp">
         <LinearLayout android:orientation="vertical" android:layout_width="match_parent" android:layout_height="wrap_content" android:padding="14dp">

@@ -3,7 +3,9 @@ package com.whisperkeyboard
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
+import android.view.View
 import android.view.inputmethod.InputMethodManager
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ProgressBar
@@ -31,6 +33,12 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvModelInfo: TextView
     private lateinit var progress: ProgressBar
+
+    private val liveIntervals =
+        arrayOf("5 seconds", "10 seconds", "15 seconds", "20 seconds", "30 seconds")
+
+    private val liveIntervalValues =
+        arrayOf(5, 10, 15, 20, 30)
 
     private val models = arrayOf("tiny", "base", "small", "medium")
     private val langs = arrayOf("auto", "en", "zh", "ja", "ko", "fr", "de", "es")
@@ -68,6 +76,54 @@ class SettingsActivity : AppCompatActivity() {
         swCaps.isChecked = prefs.getString("caps_mode", "auto") != "off"
         swVad.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("vad_on", b).apply(); saved() }
         swLive.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("live_on", b).apply(); saved() }
+
+        val liveAdapter =
+            ArrayAdapter(
+                this,
+                R.layout.spinner_item,
+                liveIntervals
+            )
+
+        liveAdapter.setDropDownViewResource(
+            R.layout.spinner_dropdown_item
+        )
+
+        val spinnerLiveInterval =
+            findViewById<Spinner>(R.id.spinnerLiveInterval)
+
+        spinnerLiveInterval.adapter = liveAdapter
+
+        val savedLive =
+            prefs.getInt("live_interval_s", 10)
+
+        spinnerLiveInterval.setSelection(
+            liveIntervalValues.indexOf(savedLive)
+                .coerceAtLeast(0)
+        )
+
+        spinnerLiveInterval.onItemSelectedListener =
+            object : AdapterView.OnItemSelectedListener {
+
+                override fun onItemSelected(
+                    parent: AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    prefs.edit()
+                        .putInt(
+                            "live_interval_s",
+                            liveIntervalValues[position]
+                        )
+                        .apply()
+
+                    saved()
+                }
+
+                override fun onNothingSelected(
+                    parent: AdapterView<*>?
+                ) {}
+            }
         swBt.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("bt_mic", b).apply(); saved() }
         swCaps.setOnCheckedChangeListener { _, b -> prefs.edit().putString("caps_mode", if (b) "auto" else "off").apply(); saved() }
 
@@ -327,7 +383,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun downloadModel(model: String) {
         progress.visibility = ProgressBar.VISIBLE
-        tvStatus.text = "Downloading ggml-$model.bin ..."
+        tvStatus.text = "Downloading Moonshine $model Streaming model ..."
         lifecycleScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -335,7 +391,7 @@ class SettingsActivity : AppCompatActivity() {
                         runOnUiThread { progress.progress = p; tvStatus.text = msg }
                     }
                 }
-                tvStatus.text = "Ready: ggml-$model.bin"
+                tvStatus.text = "Moonshine $model ready"
                 Toast.makeText(this@SettingsActivity, "Model $model ready", Toast.LENGTH_LONG).show()
                 refreshModelInfo()
             } catch (e: Exception) {

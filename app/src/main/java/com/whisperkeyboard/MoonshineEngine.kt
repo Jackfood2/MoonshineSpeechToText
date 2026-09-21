@@ -173,6 +173,9 @@ object MoonshineEngine {
                 micTranscriber = null
                 loadedModel = null
                 loadedArch = -1
+
+                KeyboardAutoStart.reset()
+
                 AppLog.i(TAG, "unloaded $was")
                 ModelNotifier.unloaded(was)
                 true
